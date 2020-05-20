@@ -1,0 +1,369 @@
+---
+title: "Big League Advance"
+author: "Bjorn Johnson"
+date: "3/4/2020"
+output: html_document
+---
+
+#Load Packages
+```{r}
+
+#if package isn't read in with library() function, you have to install package first using
+#>install.packages("package_name")
+
+library(tidyverse)
+library(caret)
+library(MASS)
+library(StatMeasures)
+library(gains)
+library(corrplot)
+library(scales)
+library(mlbench)
+library(Metrics)
+library(data.table)
+
+```
+
+#Read in Predictive Modeling Assessment Data
+```{r}
+
+BLA_DATA <-
+  read.csv(
+    "../BLA/PredictiveModelingAssessmentData.csv",
+    header = T,
+    na.strings = c("", " "))
+
+str(BLA_DATA)
+
+```
+
+
+#Checking distributions/normality/correlations
+```{r}
+
+#correlations
+
+numeric_vars <-
+  select_if(BLA_DATA,is.numeric) #get only numeric variables
+
+BLA_CORRELATION <- cor(numeric_vars,use = "complete.obs") #creates vector of correlations
+
+corrplot(
+  BLA_CORRELATION,
+  method = "number",
+  order = "AOE",
+  tl.cex = .8,
+  tl.col = "black"
+)
+
+#checking distributions of x1,x2,y
+ggplot(gather(numeric_vars),aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales = "free_x")
+
+#x2 is skewed, so will try log-transforming to induce normality
+
+BLA_DATA$x2log <- log(BLA_DATA$x2)
+
+ggplot(BLA_DATA,aes(BLA_DATA$x2log)) +
+  geom_histogram(col = "green", alpha = 0.5, na.rm = T) +
+  labs(title = "Histogram") #looks to be more normally distributed with low outliers
+
+BLA_DATA$x2log_outlierremoval <-
+  squish(BLA_DATA$x2log,
+         quantile(BLA_DATA$x2log, c(.01, .99), na.rm = TRUE))
+
+BLA_DATA_Normality_Test <- BLA_DATA %>% 
+  dplyr::select(x2,x2log,x2log_outlierremoval)
+
+ggplot(gather(BLA_DATA_Normality_Test),aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales = "free_x")#outlier removal looks OK, will need to further test additional options--boxcox maybe
+
+```
+
+#Data Splitting
+```{r}
+
+set.seed(123) #randomization starting point, ensures same results even if run in different session
+
+trainIndex <-
+  createDataPartition(BLA_DATA$y,
+                      p = 0.80,
+                      list = FALSE)
+
+BLA_TRAIN <-
+  BLA_DATA[trainIndex, ] #training data (80% of data)
+
+BLA_TEST <-
+  BLA_DATA[-trainIndex, ] #testing data (20% of data)
+
+```
+
+#First Model Building--linear regression
+```{r}
+
+set.seed(123)
+
+BLA_Model_LinearRegression <- train(
+  y ~ ., #response variable regressed on all variables specified below
+  method = "lm",
+  data = BLA_TRAIN[,c(1:2,5)],
+  metric = "RMSE", #optimization metric (Root Mean Squared Error--better than MSE due to interpretability)
+  trControl = trainControl(
+    method = "repeatedcv", #helps prevent overfitting
+    number =
+      10, #10 fold
+    verboseIter = TRUE,
+    #preProcess(BLA_TRAIN,method=c("BoxCox")), #centers & scales data for better convergence
+    repeats =
+      3
+  )
+)
+
+VarImpPlot <- varImp(BLA_Model_LinearRegression)
+plot(VarImpPlot, main = "Model")
+```
+
+
+#Model Building--xgboost?
+##Takes some time to run model training
+```{r}
+#hyperparameter grid
+
+tune_grid <- expand.grid(
+  nrounds = seq(100,500,200),
+  eta = c(0.0001,0.01),
+  max_depth = c(1,2),
+  gamma = 0,
+  colsample_bytree = c(0.6,0.8),
+  min_child_weight = 1,
+  subsample = c(0.80,1)
+)
+
+set.seed(123)
+
+BLA_Model_xgboost <- train(
+  y ~ ., #response variable regressed on all variables specified below
+  tuneGrid = data.frame(tune_grid),
+  method = "xgbTree", #extreme gradient boosting algorithm
+  data = BLA_TRAIN[,c(1:2,5)],
+  metric = "RMSE", #optimization metric (Root Mean Squared Error--better than MSE due to interpretability)
+  trControl = trainControl(
+    method = "repeatedcv", #helps prevent overfitting
+    number =
+      10, #10 fold
+    verboseIter = TRUE,
+    #preProcess(BLA_TRAIN,method=c("BoxCox")), #centers & scales data for better convergence
+    repeats =
+      3
+  )
+)
+
+#save model as .rds file to avoid having to re-train model
+pth<-'../BLA/BLA_Model_xgboost.rds'
+saveRDS(BLA_Model_xgboost, pth)
+
+#load the model:
+
+BLA_Model_xgboost <- readRDS('../BLA/BLA_Model_xgboost.rds')
+
+
+plot(BLA_Model_xgboost)#looks like RMSE keeps dropping with more trees--next iteration will try more trees and higher learning rate
+
+VarImpPlot_xgboost <- varImp(BLA_Model_xgboost)
+plot(VarImpPlot_xgboost, main = "Model")
+```
+
+#Xgboost v2
+```{r}
+
+tune_grid2 <- expand.grid(
+  nrounds = c(750,1000,1500),
+  eta = c(0.01, 0.1),
+  max_depth = c(2),
+  gamma = 0,
+  colsample_bytree = c(0.8),
+  min_child_weight = 1,
+  subsample = c(0.80)
+)
+
+set.seed(123)
+
+BLA_Model_xgboost2 <- train(
+  y ~ ., #response variable regressed on all variables specified below
+  tuneGrid = data.frame(tune_grid2),
+  method = "xgbTree", #extreme gradient boosting algorithm
+  data = BLA_TRAIN[,c(1:2,5)],
+  metric = "RMSE", #optimization metric (Root Mean Squared Error--better than MSE due to interpretability)
+  trControl = trainControl(
+    method = "repeatedcv", #helps prevent overfitting
+    number =
+      10, #10 fold
+    verboseIter = TRUE,
+    #preProcess(BLA_TRAIN,method=c("BoxCox")), #centers & scales data for better convergence
+    repeats =
+      3
+  )
+)
+
+#save model as .rds file to avoid having to re-train model
+pth<-'../BLA/BLA_Model_xgboost2.rds'
+saveRDS(BLA_Model_xgboost2, pth)
+
+#load the model:
+
+BLA_Model_xgboost2 <- readRDS('../BLA/BLA_Model_xgboost2.rds')
+
+
+plot(BLA_Model_xgboost2)#1000 rounds, max depth 2, learning rate 0.01 looks to be best fit
+```
+
+
+#Model Evaluations
+```{r}
+
+#xgboost predictions
+xgboost_predicted <- predict(BLA_Model_xgboost2,BLA_TEST)
+
+mse(BLA_TEST$y,xgboost_predicted)
+
+xgboost_predicted_TRAIN <- predict(BLA_Model_xgboost2,BLA_TRAIN)
+
+mse(BLA_TRAIN$y,xgboost_predicted_TRAIN)
+
+#linear regression predictions
+linearregression_predicted <- predict(BLA_Model_LinearRegression,BLA_TEST)
+
+mse(BLA_TEST$y,linearregression_predicted)
+
+linearregression_predicted_TRAIN <- predict(BLA_Model_LinearRegression,BLA_TRAIN)
+
+mse(BLA_TRAIN$y,linearregression_predicted_TRAIN)
+```
+
+##Plotting actual vs residual
+###Xgboost
+```{r}
+#TEST DATA
+predicted <- predict(BLA_Model_xgboost2,BLA_TEST)
+
+residuals <- BLA_TEST$y - predicted
+
+plot(predicted,residuals)
+
+RMSE <- sqrt(mean(residuals^2))
+
+cat('The RMSE of the BLA test data is ',round(RMSE,3),'\n')
+
+y_test_mean <- mean(BLA_TEST$y)
+
+# Calculate total sum of squares
+tss <- sum((BLA_TEST$y - y_test_mean)^2)
+
+# Calculate residual sum of squares
+rss <- sum(residuals^2)
+
+# Calculate R-squared
+rsq <- 1- (rss/tss)
+
+cat('The R-square of the BLA test data is ', round(rsq,3),'\n')
+
+options(repr.plot.width=8, repr.plot.height= 4)
+
+BLA_plot_data <- as.data.frame(cbind(predicted = predicted, observed = BLA_TEST))
+observed <- BLA_TEST$y
+
+# Plot predictions vs test data
+ggplot(BLA_plot_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+  geom_smooth(method=lm) + ggtitle("Extreme Gradient Boosting: Prediction vs Test Data") +
+  xlab("Predecited Power Output ") + ylab("Observed Power Output") + 
+  theme(plot.title = element_text(color="darkgreen",size=16,hjust = 0.5),
+        axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+        axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+
+#TRAIN DATA
+predicted <- predict(BLA_Model_xgboost2,BLA_TRAIN)
+
+residuals <- BLA_TRAIN$y - predicted
+
+plot(predicted,residuals)
+
+RMSE <- sqrt(mean(residuals^2))
+
+cat('The RMSE of the BLA TRAIN data is ',round(RMSE,3),'\n')
+
+y_TRAIN_mean <- mean(BLA_TRAIN$y)
+
+# Calculate total sum of squares
+tss <- sum((BLA_TRAIN$y - y_TRAIN_mean)^2)
+
+# Calculate residual sum of squares
+rss <- sum(residuals^2)
+
+# Calculate R-squared
+rsq <- 1- (rss/tss)
+
+cat('The R-square of the BLA TRAIN data is ', round(rsq,3),'\n')
+
+options(repr.plot.width=8, repr.plot.height= 4)
+
+BLA_plot_data <- as.data.frame(cbind(predicted = predicted, observed = BLA_TRAIN))
+observed <- BLA_TRAIN$y
+
+# Plot predictions vs TRAIN data
+ggplot(BLA_plot_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+  geom_smooth(method=lm) + ggtitle("Extreme Gradient Boosting: Prediction vs TRAIN Data") +
+  xlab("Predecited Power Output ") + ylab("Observed Power Output") + 
+  theme(plot.title = element_text(color="darkgreen",size=16,hjust = 0.5),
+        axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+        axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+
+#Train and Test data both look similar in terms of RMSE, R-squared, normal residual plot, and predictions vs actuals
+```
+
+#Scoring Test Data csv file
+```{r}
+
+BLA_TEST_DATA <- fread("../BLA/TestData.csv")
+
+#using same transformation as training data
+BLA_TEST_DATA$x2log <- log(BLA_TEST_DATA$x2)
+
+ggplot(BLA_TEST_DATA,aes(BLA_TEST_DATA$x2log)) +
+  geom_histogram(col = "green", alpha = 0.5, na.rm = T) +
+  labs(title = "Histogram")
+
+BLA_TEST_DATA$x2log_outlierremoval <-
+  squish(BLA_TEST_DATA$x2log,
+         quantile(BLA_TEST_DATA$x2log, c(.01, .99), na.rm = TRUE))
+
+BLA_TEST_DATA$prediction <- cbind(predict(BLA_Model_xgboost2,BLA_TEST_DATA))
+
+# fwrite(BLA_TEST_DATA,"../BLA/TestDataPredictions.csv")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
